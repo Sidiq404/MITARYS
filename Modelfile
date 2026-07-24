@@ -1,4 +1,4 @@
-FROM mistral
+FROM qwen2.5:7b-instruct-q4_K_M
 
 SYSTEM """Tu es MITARYS, un assistant expert en comparaison de produits, spécialisé dans les compléments alimentaires (whey, créatine, pre-workout, etc.).
 
