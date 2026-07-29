@@ -1,213 +1,428 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# MITARYS - le CODE fait les calculs, le modele ne fait QUE comparer.
-# Version Groq (cloud, pas de RAM locale utilisee) - modele : GPT OSS 20B
+# MITARYS AI - Agent conversationnel autonome
+# Groq (GPT OSS 120B) + Serper (recherche web) + Pinecone (memoire long terme)
+
 from groq import Groq
-import os
+from pinecone import Pinecone
+from datetime import datetime
 from dotenv import load_dotenv
+import requests
+import os
+import re
+import time
+import json
+import hashlib
 
-load_dotenv()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))  # remplace par ta vraie clé Groq
+load_dotenv(override=True)
 
-# ====== TES DONNEES : la SEULE partie a modifier ======
-produit_A = {
-    "nom": "Whey A",
-    "prix": 30.0,
-    "quantite_kg": 1.0,
-    "proteines_portion_g": 24.0,
-    "nombre_portions": 33,
-}
-produit_B = {
-    "nom": "Whey B",
-    "prix": 45.0,
-    "quantite_kg": 2.0,
-    "proteines_portion_g": 20.0,
-    "nombre_portions": 66,
-}
+# ====== CLIENTS API ======
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+pc          = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+index       = pc.Index("mitarys-products")
+SERPER_KEY  = os.environ.get("SERPER_API_KEY")
 
-# ====== LES CALCULS (faits par le code, jamais par l'IA) ======
+# ====== CONFIGURATION ======
+MODELE          = "openai/gpt-oss-120b"
+PROMPT_VERSION  = "v4"                 # incrementer a chaque changement de prompt
+DUREE_VALIDITE  = 7 * 24 * 3600        # 7 jours en secondes
+MAX_HISTORIQUE  = 12                   # 6 echanges (user + assistant)
+
+DATE_DU_JOUR = datetime.now().strftime("%d/%m/%Y")
+ANNEE        = datetime.now().year
+
+# ====== SYSTEM PROMPT ======
+system_prompt = f"""CONTEXTE TEMPOREL — LIS CECI EN PREMIER
+Nous sommes le {DATE_DU_JOUR}. Nous sommes en {ANNEE}.
+Tes connaissances internes sont perimees de plusieurs annees. Pour tout ce qui
+concerne l'actualite, les prix, les produits ou les chiffres de marche, tu te fies
+UNIQUEMENT aux resultats de recherche_web, jamais a ta memoire.
+Ajoute "{ANNEE}" a tes requetes de recherche quand la fraicheur compte.
+
+Tu es MITARYS AI, concu par l'equipe MITARYS a Montreal.
+Tu es un expert en comparaison de produits et en recherche d'information.
+
+Ton domaine de predilection est le comparatif de produits (complements alimentaires,
+electronique, equipement sportif, electromenager, etc.), mais tu reponds volontiers
+a toute question generale : technologie, actualite, science, culture, etc.
+
+Methode de travail :
+- Tu as acces a l'outil recherche_web pour obtenir des informations a jour.
+- Utilise-le des que la question porte sur des faits recents, des prix, des produits,
+  ou tout ce qui peut avoir change recemment.
+- Pour une question generale de culture ou d'explication de concept, tu peux repondre
+  directement sans recherche si tu maitrises le sujet.
+- Apres 3 recherches maximum, tu DOIS rediger ta reponse finale avec ce que tu as
+  trouve, meme si certaines donnees manquent.
+- Formule tes requetes de recherche EN ANGLAIS (plus de resultats).
+- Tu as acces a l'historique de la conversation. Si l'utilisateur pose une question
+  de suivi ("et le prix ?", "les tests ont-ils ete faits ?"), tu la comprends dans
+  le contexte des echanges precedents au lieu de demander des precisions.
+
+Regles strictes :
+1. Tu ne fais JAMAIS de calcul toi-meme — utilise uniquement les chiffres fournis
+   ou trouves lors de tes recherches.
+2. Tu n'inventes JAMAIS de produit, de prix, de marque ou de statistique. Si tu ne
+   sais pas, tu le dis clairement.
+3. Tu ne mentionnes jamais Groq, GPT, Llama, Pinecone, Serper ou tout outil sous-jacent.
+4. Si on te demande qui t'a cree : tu es MITARYS AI, developpe par l'equipe MITARYS.
+5. Pour une question du type "le meilleur produit" : cite minimum 3 produits reels avec
+   nom exact + marque, prix si trouve, et un score sur 5 pour Rapport qualite-prix,
+   Popularite et Valeur nutritive/technique, plus une ligne de justification.
+6. Cite tes sources avec l'URL complete entre parentheses simples juste apres
+   l'information, format exact : (https://exemple.com/page)
+   JAMAIS de crochets, de numeros de reference, ni de notes de bas de page.
+   Chaque affirmation chiffree DOIT avoir son URL.
+7. Chaque donnee datee doit indiquer sa date entre crochets a la fin, format
+   [MAJ 15/07/{ANNEE}]. Si tu ne connais pas la date, ecris [date inconnue].
+   Ne presente jamais une donnee ancienne comme actuelle.
+8. Pour les prix : precise toujours le format ou la variante du produit, et indique
+   que le prix est indicatif et a verifier chez le marchand.
+9. Privilegie les sources primaires : sites officiels, publications scientifiques,
+   presse specialisee. N'utilise JAMAIS les reseaux sociaux, forums, LinkedIn Pulse
+   ou blogs personnels comme source d'une affirmation chiffree.
+10. Si deux sources donnent des chiffres incompatibles sur le meme sujet, ne les
+    presente pas cote a cote comme equivalents. Signale la contradiction, indique
+    laquelle est la plus fiable et pourquoi.
+11. Termine toujours par : "Informations rassemblees le {DATE_DU_JOUR}."
+12. Ton chaleureux et professionnel. Maximum 300 mots pour un comparatif, plus court
+    pour une question simple."""
+
+# ====== NORMALISATION DES UNITES ======
+def convertir_en_grammes(texte):
+    """Convertit '5 lb', '2.5 kg', '2270 g' -> grammes (float). None si illisible."""
+    if texte is None:
+        return None
+    if isinstance(texte, (int, float)):
+        return float(texte)
+
+    t = str(texte).lower().strip().replace(",", ".")
+    match = re.search(r"([\d.]+)", t)
+    if not match:
+        return None
+    nombre = float(match.group(1))
+
+    if "lb" in t or "pound" in t:
+        return nombre * 453.6
+    if "oz" in t:
+        return nombre * 28.35
+    if "kg" in t:
+        return nombre * 1000
+    if "g" in t:
+        return nombre
+    return None
+
+# ====== CALCULS PYTHON (jamais faits par le LLM) ======
 def calculer(p):
-    prix_par_kg = p["prix"] / p["quantite_kg"]
-    prix_par_portion = p["prix"] / p["nombre_portions"]
+    quantite = p["quantite_kg"]
+    if isinstance(quantite, str):
+        grammes = convertir_en_grammes(quantite)
+        if grammes is None:
+            raise ValueError(f"Poids illisible : {quantite}")
+        quantite = grammes / 1000
+
+    prix_par_kg       = p["prix"] / quantite
+    prix_par_portion  = p["prix"] / p["nombre_portions"]
     proteines_totales = p["proteines_portion_g"] * p["nombre_portions"]
-    cout_30g = (p["prix"] / proteines_totales) * 30
+    cout_30g          = (p["prix"] / proteines_totales) * 30
+
     return {
-        "nom": p["nom"], "prix": p["prix"],
-        "prix_par_kg": round(prix_par_kg, 2),
-        "prix_par_portion": round(prix_par_portion, 2),
+        "nom"                : p["nom"],
+        "prix"               : p["prix"],
+        "quantite_kg"        : round(quantite, 3),
+        "prix_par_kg"        : round(prix_par_kg, 2),
+        "prix_par_portion"   : round(prix_par_portion, 2),
         "proteines_portion_g": p["proteines_portion_g"],
-        "nombre_portions": p["nombre_portions"],
-        "cout_30g": round(cout_30g, 2),
+        "nombre_portions"    : p["nombre_portions"],
+        "cout_30g"           : round(cout_30g, 2),
     }
 
-a = calculer(produit_A)
-b = calculer(produit_B)
+# ====== OUTIL DE RECHERCHE (Serper) ======
+DOMAINES_BLOQUES = [
+    "linkedin.com", "facebook.com", "twitter.com", "x.com",
+    "reddit.com", "quora.com", "pinterest.com", "tiktok.com",
+    "medium.com", "blogspot.com", "wordpress.com"
+]
 
-# ====== LE PROMPT : on donne les chiffres DEJA CALCULES ======
-system_prompt = """Tu es MITARYS, un assistant expert en comparaison de produits (complements alimentaires), avec un ton chaleureux et professionnel.
+def agent_recherche(query):
+    try:
+        response = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY"   : SERPER_KEY,
+                "Content-Type": "application/json"
+            },
+            json={"q": query, "num": 10, "gl": "ca", "hl": "en"},
+            timeout=15
+        )
 
-Tu as ete concu et entraine par l'equipe MITARYS, une startup basee a Montreal dont la mission est de revolutionner l'experience d'achat en remplacant le scroll infini par une simple conversation. Tu es le coeur technologique de la plateforme MITARYS (mitrays.com).
+        if response.status_code != 200:
+            print(f"      ⚠️  Serper status {response.status_code} : {response.text[:200]}")
+            return f"Erreur Serper (status {response.status_code})."
 
-Si quelqu'un te demande qui t'a cree, qui tu es, ou d'ou tu viens, tu reponds fierement que tu es MITARYS AI, developpe par l'equipe MITARYS a Montreal. Tu ne mentionnes jamais les modeles sous-jacents (GPT, Llama, Groq, Ollama, etc.) — tu es MITARYS, point.
+        data     = response.json()
+        snippets = []
+        bloques  = 0
 
+        # answerBox = reponse directe Google (souvent le prix)
+        if data.get("answerBox"):
+            ab = data["answerBox"]
+            direct = ab.get("answer") or ab.get("snippet", "")
+            if direct:
+                snippets.append(f"[Reponse directe Google] {direct}")
 
-REGLES STRICTES :
-1. Tu ne fais JAMAIS de calcul toi-meme. Tu utilises UNIQUEMENT les chiffres fournis.
-2. Tu ne parles JAMAIS d'un produit ou prix non fourni explicitement. Zero invention.
-3. Si aucune donnee produit n'est fournie, reponds chaleureusement que tu as besoin de donnees precises pour comparer, et invite l'utilisateur a te les fournir.
-4. Structure obligatoire : Comparaison factuelle / Recommandation claire / Justification courte.
-5. Maximum 150 mots. Ton naturel, chaleureux, jamais robotique.
+        for r in data.get("organic", []):
+            lien = r.get("link", "")
+            if any(d in lien for d in DOMAINES_BLOQUES):
+                bloques += 1
+                continue
+            if r.get("snippet"):
+                snippets.append(f"{r.get('title','')} ({lien}) : {r.get('snippet','')}")
 
-=== BASE DE CONNAISSANCES WHEY ===
+        if not snippets:
+            return "Aucun resultat exploitable pour cette requete."
 
-TYPES DE WHEY :
-- Concentrate (WPC) : 70-80% proteines, contient lactose et gras residuels, option la plus economique, suffisant pour debutants sans intolerance
-- Isolate (WPI) : 90%+ proteines, quasi-zero lactose, ideal intolerants et athletes en seche, absorption rapide, score DIAAS > 1.0
-- Hydrolysate (WPH) : pre-digere, absorption maximale, le plus cher, utile surtout athletes elite ou digestion difficile
+        resultat = "\n\n".join(snippets[:7])
+        info_bloc = f", {bloques} source(s) non fiable(s) ecartee(s)" if bloques else ""
+        print(f"      ✅ {len(snippets)} resultats ({len(resultat)} caracteres{info_bloc})")
+        return resultat
 
-LEUCINE ET QUALITE ANABOLIQUE :
-- Seuil optimal muscle protein synthesis (MPS) : 2.5 a 3.0g de leucine par prise
-- Bonne whey = environ 11% de leucine sur total proteique (25g proteines = ~2.75g leucine)
-- BCAA totaux doivent representer ~25% du total proteique
-- Si leucine < 2.5g pour 25g proteines affiches = signal d'alarme
+    except Exception as e:
+        print(f"      ⚠️  Erreur Serper : {e}")
+        return f"Erreur lors de la recherche : {e}"
 
-DOSAGE SCIENTIFIQUE :
-- Par prise : 0.24g/kg au repos, 0.40g/kg apres entrainement intense
-- Journalier : 1.6 a 2.2g/kg/jour pour maximiser les gains
-- 40g par prise = plafond pratique (au-dela oxyde comme energie, pas utilise pour le muscle)
-- 3-4 prises espacees de 3-4h = plus efficace qu'une grosse dose unique
-- Fenetre anabolique de 30min post-workout = mythe : viser dans les 2 heures suffit
+# ====== DEFINITION DE L'OUTIL POUR LE LLM ======
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "recherche_web",
+        "description": (
+            "Recherche sur le web en temps reel. Utilise cet outil 2 a 3 fois maximum "
+            "avec des requetes differentes, puis redige ta reponse finale."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Requete de recherche, formulee en anglais"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}]
 
-RED FLAGS SUR L'ETIQUETTE :
-- Amino/Nitrogen spiking : glycine, taurine, creatine en haut de liste d'ingredients d'une "whey pure" = fraude possible
-- Proprietary blend : cache les vraies quantites, eviter
-- Ratio suspect : portion de 40g pour seulement 22g proteines (55%) = remplissage excessif
-- Prix suspicieusement bas sans aucune certification = risque eleve
+# ====== MEMOIRE LONG TERME (Pinecone) ======
+def get_embedding(text):
+    response = pc.inference.embed(
+        model      = "llama-text-embed-v2",
+        inputs     = [text],
+        parameters = {"input_type": "query"}
+    )
+    return response[0].values
 
-METRIQUES DE COMPARAISON (ordre de priorite) :
-1. Cout pour 30g de proteines = LE vrai indicateur de rapport qualite-prix
-2. Leucine par portion si declaree
-3. Pourcentage proteines/poids de portion (detecte remplissage)
-4. Type de whey selon profil utilisateur
-5. Certification tierce partie
-6. Ingredients propres (pas d'amino spiking)
+def agent_memoire_chercher(query):
+    print("🧠 Memoire → Pinecone...")
+    try:
+        vector  = get_embedding(query)
+        results = index.query(vector=vector, top_k=1, include_metadata=True)
 
-PROFILS UTILISATEURS :
-- Debutant/petit budget : Concentrate, bon rapport qualite-prix, suffisant
-- Intolerant au lactose : Isolate obligatoire, concentrate a eviter
-- Athlete en seche : Isolate ou Hydrolysate, sucre < 2g/portion, lipides < 2g/portion
-- Prise de masse : Concentrate acceptable, glucides residuels pas un probleme
-- Sensibilite digestive : Tester isolate d'abord, eviter exces d'edulcorants
+        if results.matches and results.matches[0].score > 0.95:
+            meta = results.matches[0].metadata
 
-=== CERTIFICATIONS : GUIDE COMPLET (CANADA + INTERNATIONAL) ===
+            if meta.get("prompt_ver") != PROMPT_VERSION:
+                print("   ⏭️  Reponse d'une ancienne version du prompt, ignoree.")
+                return None
 
--- CANADA (prioritaire pour MITARYS Montreal) --
+            age = int(time.time()) - int(meta.get("timestamp", 0))
+            if age > DUREE_VALIDITE:
+                print(f"   ⏭️  Reponse perimee ({age // 86400} jours), ignoree.")
+                return None
 
-NPN - Natural Product Number (Health Canada) :
-- Numero a 8 chiffres obligatoire pour vendre legalement un produit de sante naturel au Canada
-- Delivre par la Direction des produits de sante naturels et sans ordonnance (DPSNSO) de Sante Canada
-- Ce que ca garantit : securite, efficacite, qualite, conformite de l'etiquette
-- Processus : le fabricant soumet une demande de licence produit (PLA) avec preuves scientifiques, liste complete des ingredients, posologie, mises en garde - Sante Canada evalue et approuve avant la mise en vente
-- IMPORTANT : tous les produits proteiques ne necessitent pas un NPN. Un supplement proteine simple vendu comme aliment peut etre classe comme "aliment supplementaire" et ne pas exiger de NPN. Un NPN est requis surtout si le produit fait des allégations sante specifiques ou contient des vitamines/mineraux/substances bioactives ajoutees
-- Comment verifier : Base de donnees des produits de sante naturels homologues de Sante Canada (accessible en ligne, chercher par nom de produit ou numero NPN)
-- DIN-HM : equivalent du NPN pour les medicaments homeopathiques (different du NPN)
-- Site Licence : en plus du NPN produit, le fabricant doit avoir une licence de site (installation de fabrication conforme aux BPF - Bonnes Pratiques de Fabrication)
-- Le NPN est PLUS strict que la reglementation US (FDA) car il exige une approbation pre-marche. Aux USA, les supplements peuvent etre vendus sans approbation prealable de la FDA
-- Etiquetage bilingue (anglais et francais) obligatoire pour tout produit avec NPN vendu au Canada
+            print(f"   ✅ Trouve en memoire (score {results.matches[0].score:.3f})")
+            return meta.get("response")
 
-Limite importante du NPN a connaitre :
-- Le NPN garantit que l'etiquette correspond au contenu et que le produit est sur. Il NE garantit PAS que le produit est le meilleur du marche ou qu'il n'y a pas d'amino spiking (le spiking est detecte si l'etiquette est exacte, mais le NPN ne teste pas specifiquement le ratio proteine reelle vs acides amines libres ajoutes)
-- Un NPN + certification tierce partie (Informed Sport ou NSF) = le combo ideal pour le consommateur canadien
+        print("   ❌ Pas en memoire, recherche en cours...")
+        return None
+    except Exception as e:
+        print(f"   ⚠️  Pinecone : {e}")
+        return None
 
--- INTERNATIONAL --
+def agent_memoire_sauvegarder(query, response):
+    print("💾 Sauvegarde Pinecone...")
+    try:
+        vector = get_embedding(query)
+        doc_id = hashlib.md5(query.encode()).hexdigest()
+        index.upsert(vectors=[{
+            "id"      : doc_id,
+            "values"  : vector,
+            "metadata": {
+                "query"     : query,
+                "response"  : response,
+                "timestamp" : int(time.time()),
+                "prompt_ver": PROMPT_VERSION
+            }
+        }])
+        print("   ✅ Sauvegarde.")
+    except Exception as e:
+        print(f"   ⚠️  Erreur sauvegarde : {e}")
 
-NSF Certified for Sport :
-- Reference absolue en Amerique du Nord (US + Canada)
-- Reconnu par USADA, NFL, MLB, NHL, NBA, PGA, LPGA, CFL (Canadian Football League), Ironman, NASCAR
-- Tests : substances interdites WADA, conformite etiquette vs contenu reel, contaminants, audits GMP annuels de l'usine
-- Conservation des echantillons pour reference en cas de controle antidopage
-- Verifiable sur nsfsport.com par numero de lot
-- Niveau de rigueur : parmi les plus eleves disponibles
+# ====== BOUCLE AGENTIQUE (le coeur de MITARYS) ======
+def agent_boucle(question, contexte_calcul=None, historique=None, max_tours=4):
+    contenu_user = question
 
-Informed Sport :
-- Programme mondial de reference pour les sportifs de competition
-- Tests : liste WADA 250+ substances interdites, chaque lot avant mise en vente
-- Post-certification : tests a l'aveugle en continu
-- Reconnue par organisations antidopage mondiales, forces armees, ligues professionnelles
-- 1 supplement sur 10 environ contient des substances interdites non declarees
-- Verifiable sur sport.wetestyoutrust.com
+    if contexte_calcul:
+        a, b = contexte_calcul
+        contenu_user += f"""
 
-Informed Choice :
-- Version moins stricte d'Informed Sport (meme organisme LGC)
-- Tests : mensuel sur echantillons (pas chaque lot comme Informed Sport)
-- Suffisant pour le grand public non soumis a controle antidopage
-- Moins de garanties qu'Informed Sport pour un athlete de competition
+Chiffres deja calcules (ne recalcule rien) :
 
-BSCG Certified Drug Free :
-- Fonde par les pionniers des tests antidopage olympiques
-- Tests chaque lot (comme Informed Sport)
-- Moins connu au Canada mais reconnu par UFC et plusieurs ligues sportives
-- Audit GMP annuel obligatoire
+{a['nom']} : {a['prix']}$ | {a['quantite_kg']}kg | {a['prix_par_kg']}$/kg | {a['prix_par_portion']}$/portion | {a['proteines_portion_g']}g prot/portion | {a['nombre_portions']} portions | {a['cout_30g']}$ pour 30g prot
 
-USP Verified :
-- Standard pharmaceutique, moins de 2% des supplements le portent
-- Verifie : identite des ingredients, purete, potency, fabrication
-- Pas specialement oriente "substances interdites sport" comme NSF/Informed Sport
-- Excellente garantie pour vitamines et mineraux basiques
+{b['nom']} : {b['prix']}$ | {b['quantite_kg']}kg | {b['prix_par_kg']}$/kg | {b['prix_par_portion']}$/portion | {b['proteines_portion_g']}g prot/portion | {b['nombre_portions']} portions | {b['cout_30g']}$ pour 30g prot"""
 
-GMP (Good Manufacturing Practices / Bonnes Pratiques de Fabrication) :
-- ATTENTION : GMP signifie que l'usine est propre et controlee, PAS que le produit a ete teste
-- GMP = l'usine respecte les standards de production (FDA aux USA, Sante Canada au Canada)
-- GMP SANS certification tierce partie = garantie de processus, pas de contenu du produit
-- Les vraies certifications (NSF, Informed Sport) incluent l'audit GMP ET les tests produit
+    messages = [{"role": "system", "content": system_prompt}]
+    if historique:
+        messages.extend(historique)
+    messages.append({"role": "user", "content": contenu_user})
 
--- TABLEAU COMPARATIF CERTIFICATIONS --
-NPN Canada : obligatoire pour vendre au Canada, approbation pre-marche, garantit securite + etiquette
-NSF Certified for Sport : reference sport Amerique du Nord, tests GMP + chaque produit + substances interdites
-Informed Sport : reference mondiale sport, chaque lot, 250+ substances interdites
-Informed Choice : chaque mois (pas chaque lot), bon pour non-athletes
-BSCG : chaque lot, fort en detection substances interdites, moins connu
-USP Verified : standard pharmaceutique, excellent pour vitamines/mineraux, moins oriente sport
-GMP seul : garantit l'usine, PAS le produit teste
+    resultats_collectes = []
 
-POUR UN CONSOMMATEUR CANADIEN :
-- Minimum acceptable : NPN visible sur l'etiquette
-- Bon niveau : NPN + GMP certifie
-- Niveau optimal (athlete ou consommateur exigeant) : NPN + Informed Sport ou NSF Certified for Sport
-- Pour competitions avec controle antidopage au Canada : NSF Certified for Sport (reconnu CFL) ou Informed Sport
+    for tour in range(max_tours):
+        print(f"\n🔄 Tour {tour + 1}/{max_tours}")
 
-COMMENT VERIFIER :
-- NPN Canada : bdpsnso.gc.ca (base de donnees Sante Canada)
-- NSF : nsfsport.com (verifier numero de lot)
--Informed Sport : sport.wetestyoutrust.com
-- TOUJOURS verifier le numero de lot specifique, pas juste le nom de marque (un logo peut etre abuse)
+        response = groq_client.chat.completions.create(
+            model       = MODELE,
+            messages    = messages,
+            tools       = tools,
+            temperature = 0.3
+        )
 
-CE QUE LE PRIX NE DIT PAS :
-- Prix eleve ne garantit PAS meilleure qualite proteique (souvent juste marketing)
-- Marques maison (MyProtein, Bulk, PVL Nutrients canadien) peuvent avoir d'excellents ratios qualite-prix
-- La correlation prix/qualite dans les supplements est FAIBLE
-- Le cout/30g proteines + certifications + ingredients propres = les seuls vrais indicateurs
-"""
+        msg = response.choices[0].message
 
+        if not msg.tool_calls:
+            print("   ✅ L'agent a termine sa recherche.")
+            return msg.content
 
-prompt = f"""Quel est le meilleur proteine whey pour la seche de poids?"""
+        # Convertir l'objet Groq en dictionnaire propre
+        messages.append({
+            "role"      : "assistant",
+            "content"   : msg.content or "",
+            "tool_calls": [
+                {
+                    "id"      : c.id,
+                    "type"    : "function",
+                    "function": {
+                        "name"     : c.function.name,
+                        "arguments": c.function.arguments
+                    }
+                } for c in msg.tool_calls
+            ]
+        })
 
-# ====== ON ENVOIE A GROQ (modele GPT OSS 20B) ======
-print("=" * 55)
-print("CHIFFRES CALCULES PAR LE CODE :")
-print("=" * 55)
-print(prompt)
-print("=" * 55)
-print("REPONSE DE MITARYS (via Groq / gpt-oss-20b) :")
-print("=" * 55)
+        for call in msg.tool_calls:
+            try:
+                args    = json.loads(call.function.arguments)
+                requete = args.get("query", "")
+            except Exception:
+                requete = ""
 
-response = client.chat.completions.create(
-    model="openai/gpt-oss-20b",
-    messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt}
-    ],
-    temperature=0.3
-)
+            print(f"   🔍 Recherche : \"{requete}\"")
+            resultat = agent_recherche(requete) if requete else "Requete vide."
+            resultats_collectes.append(f"--- Recherche : {requete} ---\n{resultat}")
 
-print(response.choices[0].message.content)
+            messages.append({
+                "role"        : "tool",
+                "tool_call_id": call.id,
+                "content"     : resultat
+            })
+
+    # Max de tours atteint : reponse finale SANS outils, historique propre
+    print("\n⏱️  Max de tours atteint, generation de la reponse finale...")
+
+    messages_propres = [{"role": "system", "content": system_prompt}]
+    if historique:
+        messages_propres.extend(historique)
+    messages_propres.append({
+        "role"   : "user",
+        "content": f"""{contenu_user}
+
+Voici les resultats de recherche deja rassembles :
+
+{chr(10).join(resultats_collectes)}
+
+Redige maintenant ta reponse finale avec ces informations uniquement.
+N'appelle aucun outil."""
+    })
+
+    final = groq_client.chat.completions.create(
+        model       = MODELE,
+        messages    = messages_propres,
+        temperature = 0.3
+    )
+    return final.choices[0].message.content
+
+# ====== SUPERVISEUR ======
+def agent_superviseur(query, produit_A=None, produit_B=None, historique=None):
+    print("\n" + "=" * 55)
+    print("MITARYS AI — Agent Superviseur")
+    print("=" * 55)
+    print(f"Question : {query}\n")
+
+    # La memoire Pinecone ne sert que pour une question autonome.
+    # Une question de suivi depend du contexte de la conversation.
+    if not historique:
+        reponse_memorisee = agent_memoire_chercher(query)
+        if reponse_memorisee:
+            return reponse_memorisee
+
+    contexte_calcul = None
+    if produit_A and produit_B:
+        contexte_calcul = (calculer(produit_A), calculer(produit_B))
+
+    reponse = agent_boucle(query, contexte_calcul, historique)
+
+    if not historique:
+        agent_memoire_sauvegarder(query, reponse)
+
+    return reponse
+
+# ====== POINT D'ENTREE : CONVERSATION ======
+if __name__ == "__main__":
+    print("\n" + "=" * 55)
+    print("MITARYS AI")
+    print("=" * 55)
+    print("Commandes : 'quit' pour sortir, 'reset' pour repartir a zero.")
+
+    historique = []
+
+    while True:
+        try:
+            question = input("\n💬 Toi : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nA bientot !")
+            break
+
+        if question.lower() in ("quit", "exit", "q"):
+            print("A bientot !")
+            break
+
+        if question.lower() == "reset":
+            historique = []
+            print("🔄 Conversation reinitialisee.")
+            continue
+
+        if not question:
+            continue
+
+        reponse = agent_superviseur(question, historique=historique)
+
+        print("\n" + "=" * 55)
+        print("MITARYS AI")
+        print("=" * 55)
+        print(reponse)
+
+        historique.append({"role": "user",      "content": question})
+        historique.append({"role": "assistant", "content": reponse})
+        historique = historique[-MAX_HISTORIQUE:]
