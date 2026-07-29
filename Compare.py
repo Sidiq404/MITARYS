@@ -24,10 +24,11 @@ SERPER_KEY  = os.environ.get("SERPER_API_KEY")
 
 # ====== CONFIGURATION ======
 MODELE          = "openai/gpt-oss-120b"
-PROMPT_VERSION  = "v7"                 # incrementer des qu'un changement modifie les reponses
+PROMPT_VERSION  = "v8"                 # incrementer des qu'un changement modifie les reponses
 DUREE_VALIDITE  = 7 * 24 * 3600        # 7 jours en secondes
 MAX_HISTORIQUE  = 12                   # 6 echanges (user + assistant)
 MAX_TOURS       = 3                    # source unique de verite (prompt + outil + code)
+FORMAT_LIENS    = "terminal"           # "terminal" (cliquable), "markdown", ou "brut"
 
 DATE_DU_JOUR = datetime.now().strftime("%d/%m/%Y")
 ANNEE        = datetime.now().year
@@ -111,6 +112,9 @@ Regles strictes :
    Un identifiant produit invente (du type /12345, /produit-nom-30ml, ?id=0000)
    est une faute grave.
    Format exact quand tu as une vraie URL : (https://exemple.com/page)
+   Ecris TOUJOURS l'URL complete, meme si elle est longue et laide. L'affichage
+   est embelli automatiquement apres coup : ce n'est pas ton travail.
+   Ne raccourcis, ne resume et ne remplace jamais une URL par un nom de site.
    JAMAIS de crochets, de numeros de reference, ni de notes de bas de page.
    Si tu as une information SANS URL correspondante dans tes resultats :
      - soit tu omets l'information,
@@ -161,6 +165,21 @@ Regles strictes :
     et pourquoi.
     Une case de tableau sans donnee reste vide — tu ne la remplis jamais pour
     faire joli.
+16. MAGASIN PHYSIQUE ET VENTE EN LIGNE — ne melange jamais les deux
+    Un site marchand n'a PAS d'adresse ni de telephone. N'ecris jamais
+    "adresse non trouvee" pour Amazon, Walmart.ca, un site officiel ou toute
+    boutique en ligne : ce n'est pas une donnee manquante, c'est une colonne
+    qui n'a aucun sens pour ce type de vendeur.
+    Si ta reponse contient les deux types, fais DEUX tableaux separes :
+      "En magasin" -> colonnes : enseigne, adresse, telephone, contenance
+      "En ligne"   -> colonnes : marchand, contenance, prix, lien
+    Un seul type present ? Un seul tableau, avec les colonnes qui lui vont.
+17. CONTENANCE OBLIGATOIRE
+    Indique toujours la contenance juste a cote du nom du produit, dans la meme
+    cellule ou la meme phrase : "Niacinamide 10% + Zinc 1% — 30 ml".
+    Un prix sans contenance n'a aucune valeur pour comparer.
+    Si tu n'as pas trouve la contenance, ecris "contenance non trouvee" plutot
+    que d'en deviner une : une contenance inventee fausse tout le comparatif.
 
 RELECTURE AVANT D'ENVOYER (obligatoire, en silence) :
   - Chaque URL de ma reponse figure-t-elle telle quelle dans mes resultats ?
@@ -514,6 +533,53 @@ def detecter_prix_incoherents(reponse, seuil=3.0):
         "inexact — verifiez directement chez le marchand."
     ), 1
 
+# ====== AFFICHAGE : EMBELLISSEMENT DES LIENS ======
+# S'execute APRES la validation : on n'embellit que ce qui a ete verifie.
+# Le modele ecrit toujours l'URL complete ; le raccourci est fait ici, par du
+# code, pour ne jamais casser la comparaison caractere par caractere.
+
+NOMS_MARCHANDS = {
+    "sephora.com": "Sephora", "theordinary.com": "The Ordinary",
+    "deciem.com": "Deciem", "amazon.ca": "Amazon.ca", "amazon.com": "Amazon",
+    "walmart.ca": "Walmart", "walmart.com": "Walmart",
+    "jeancoutu.com": "Jean Coutu", "pharmaprix.ca": "Pharmaprix",
+    "shoppersdrugmart.ca": "Shoppers", "well.ca": "Well.ca",
+    "costco.ca": "Costco", "ulta.com": "Ulta", "target.com": "Target",
+    "canadiantire.ca": "Canadian Tire", "bestbuy.ca": "Best Buy",
+}
+
+def _nom_marchand(url):
+    dom = re.sub(r"^https?://(www\.)?", "", url).split("/")[0].lower()
+    for cle, nom in NOMS_MARCHANDS.items():
+        if cle in dom:
+            return nom
+    return dom.split(".")[0].capitalize()
+
+def embellir_liens(reponse, mode=None):
+    """
+    Remplace les URLs nues par un libelle lisible.
+      "terminal" : lien cliquable (sequence OSC 8, supportee par Terminal/iTerm2)
+      "markdown" : [Sephora](https://...) — pour une interface web
+      "brut"     : ne touche a rien
+    """
+    mode = mode or FORMAT_LIENS
+    if not reponse or mode == "brut":
+        return reponse
+
+    deja = set(re.findall(r"\]\((https?://[^\s\)]+)\)", reponse))
+
+    def remplacer(m):
+        url = m.group(0)
+        if url in deja:
+            return url
+        nom = _nom_marchand(url)
+        if mode == "markdown":
+            return f"[{nom}]({url})"
+        # OSC 8 : le terminal affiche `nom`, le clic ouvre `url`
+        return f"\033]8;;{url}\033\\{nom}\033]8;;\033\\"
+
+    return re.sub(r"(?<!\]\()https?://[^\s\)\]<>\"'|]+", remplacer, reponse)
+
 def valider_reponse(reponse, resultats_bruts):
     """
     Point d'entree unique du controle qualite.
@@ -530,6 +596,9 @@ def valider_reponse(reponse, resultats_bruts):
             "retirees. Verifiez les coordonnees et les prix directement aupres du "
             "marchand."
         )
+
+    # EN DERNIER, une fois tout verifie : on rend les liens lisibles.
+    reponse = embellir_liens(reponse)
 
     return reponse, total
 
@@ -594,8 +663,18 @@ OUTILS_DISPONIBLES = {
     "recherche_lieux": agent_recherche_lieux,
 }
 
-def agent_boucle(question, contexte_calcul=None, historique=None, max_tours=MAX_TOURS):
-    """Retourne (reponse, nb_anomalies) pour que l'appelant decide de la memoire."""
+def agent_boucle(question, contexte_calcul=None, historique=None,
+                 max_tours=MAX_TOURS, sources_session=None):
+    """
+    Retourne (reponse, nb_anomalies).
+    sources_session : liste accumulant les resultats de recherche de TOUTE la
+    conversation. Indispensable : sur une question de suivi, le modele repond
+    depuis l'historique sans relancer de recherche — sans cette memoire, le
+    validateur jugerait inventees des URLs pourtant verifiees au tour d'avant.
+    """
+    if sources_session is None:
+        sources_session = []
+
     contenu_user = question
 
     if contexte_calcul:
@@ -630,7 +709,7 @@ Chiffres deja calcules (ne recalcule rien) :
 
         if not msg.tool_calls:
             print("   ✅ L'agent a termine sa recherche.")
-            return valider_reponse(msg.content, "\n".join(resultats_collectes))
+            return valider_reponse(msg.content, "\n".join(sources_session))
 
         messages.append({
             "role"      : "assistant",
@@ -675,9 +754,9 @@ Chiffres deja calcules (ne recalcule rien) :
                         fonction(requete) if fonction
                         else f"Outil inconnu : {nom_outil}"
                     )
-                    resultats_collectes.append(
-                        f"--- {nom_outil} : {requete} ---\n{resultat}"
-                    )
+                    bloc = f"--- {nom_outil} : {requete} ---\n{resultat}"
+                    resultats_collectes.append(bloc)
+                    sources_session.append(bloc)
 
             messages.append({
                 "role"        : "tool",
@@ -712,10 +791,11 @@ Si une information te manque, ecris "non trouve" — n'invente rien pour complet
         temperature = 0.3
     )
     return valider_reponse(final.choices[0].message.content,
-                           "\n".join(resultats_collectes))
+                           "\n".join(sources_session))
 
 # ====== SUPERVISEUR ======
-def agent_superviseur(query, produit_A=None, produit_B=None, historique=None):
+def agent_superviseur(query, produit_A=None, produit_B=None, historique=None,
+                      sources_session=None):
     print("\n" + "=" * 55)
     print("MITARYS AI — Agent Superviseur")
     print("=" * 55)
@@ -732,7 +812,8 @@ def agent_superviseur(query, produit_A=None, produit_B=None, historique=None):
     if produit_A and produit_B:
         contexte_calcul = (calculer(produit_A), calculer(produit_B))
 
-    reponse, nb_anomalies = agent_boucle(query, contexte_calcul, historique)
+    reponse, nb_anomalies = agent_boucle(query, contexte_calcul, historique,
+                                         sources_session=sources_session)
 
     # On ne met jamais en cache une reponse douteuse, sinon une hallucination
     # est resservie a l'identique pendant 7 jours.
@@ -751,7 +832,8 @@ if __name__ == "__main__":
     print("=" * 55)
     print("Commandes : 'quit' pour sortir, 'reset' pour repartir a zero.")
 
-    historique = []
+    historique      = []
+    sources_session = []
 
     while True:
         try:
@@ -765,14 +847,16 @@ if __name__ == "__main__":
             break
 
         if question.lower() == "reset":
-            historique = []
+            historique      = []
+            sources_session = []
             print("🔄 Conversation reinitialisee.")
             continue
 
         if not question:
             continue
 
-        reponse = agent_superviseur(question, historique=historique)
+        reponse = agent_superviseur(question, historique=historique,
+                                    sources_session=sources_session)
 
         print("\n" + "=" * 55)
         print("MITARYS AI")
