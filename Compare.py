@@ -20,7 +20,7 @@ load_dotenv(override=True)
 # ====== CLIENTS API ======
 groq_client     = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 deepseek_client = OpenAI(
-    api_key  = os.environ.get("DEEPSEEK_API_KEY"),
+    api_key  = os.environ.get("DEEPSEEK_API_KEY") or "placeholder",
     base_url = "https://api.deepseek.com"
 )
 pc         = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
@@ -45,7 +45,7 @@ MODELES = {
 MODELE_DEFAUT = "VIX 1.9"
 
 
-PROMPT_VERSION = "v13"
+PROMPT_VERSION = "v14"
 DUREE_VALIDITE = 7 * 24 * 3600
 
 DATE_DU_JOUR = datetime.now().strftime("%d/%m/%Y")
@@ -172,6 +172,7 @@ def agent_recherche(query, trace):
             json={"q": query, "num": 10, "gl": "ca", "hl": "en"},
             timeout=15
         )
+        
 
         if reponse.status_code != 200:
             trace.envoyer(etape="recherche", requete=query, n=0,
@@ -210,6 +211,7 @@ def agent_recherche(query, trace):
     except Exception as e:
         trace.envoyer(etape="recherche", requete=query, n=0, erreur=str(e))
         return f"Erreur lors de la recherche : {e}"
+
 
 
 tools = [{
